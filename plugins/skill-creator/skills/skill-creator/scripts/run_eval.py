@@ -190,9 +190,9 @@ def run_single_query(
                                 return True
 
                     elif se_type == "content_block_stop":
-                        # A Skill block that finished without matching clean_name is
-                        # a sibling skill -> not triggered. A Read of some other file
-                        # is just recon -> keep scanning.
+                        # A Skill block that finished without matching trigger_token
+                        # is a sibling skill -> not triggered. A Read of some other
+                        # file is just recon -> keep scanning.
                         if pending_tool_name == "Skill":
                             return False
                         pending_tool_name = None
