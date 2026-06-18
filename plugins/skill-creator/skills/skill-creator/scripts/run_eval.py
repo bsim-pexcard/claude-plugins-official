@@ -8,7 +8,6 @@ for a set of queries. Outputs results as JSON.
 import argparse
 import json
 import os
-import select
 import subprocess
 import sys
 import time
@@ -42,30 +41,41 @@ def run_single_query(
 ) -> bool:
     """Run a single query and return whether the skill was triggered.
 
-    Creates a command file in .claude/commands/ so it appears in Claude's
-    available_skills list, then runs `claude -p` with the raw query.
-    Uses --include-partial-messages to detect triggering early from
-    stream events (content_block_start) rather than waiting for the
-    full assistant message, which only arrives after tool execution.
+    Creates a real ephemeral SKILL (.claude/skills/<clean_name>/SKILL.md) with
+    the candidate description so the model can actually invoke it via the Skill
+    tool (commands in .claude/commands are user-slash-invoked and don't reliably
+    surface to the model as invokable skills). Then runs `claude -p` with the raw
+    query and watches the stream-json for a Skill/Read tool-use that references
+    this skill's unique name. Detection spans the whole agentic turn — the model
+    frequently writes a text preamble and invokes the skill in a LATER message —
+    so only the terminal `result` event is treated as "did not trigger."
     """
     unique_id = uuid.uuid4().hex[:8]
     clean_name = f"{skill_name}-skill-{unique_id}"
-    project_commands_dir = Path(project_root) / ".claude" / "commands"
-    command_file = project_commands_dir / f"{clean_name}.md"
+    # Concurrency-safe trigger token. With num_workers>1, several ephemeral
+    # skills with this SAME description coexist in the skills dir, all sharing
+    # the "<skill_name>-skill-" prefix. The model may invoke ANY of them, so
+    # detecting "the description triggered" means matching the shared prefix,
+    # not this run's unique id (which would miscount ~(N-1)/N of real triggers).
+    # Safe across candidates because run_loop evaluates descriptions serially.
+    trigger_token = f"{skill_name}-skill-"
+    project_skills_dir = Path(project_root) / ".claude" / "skills" / clean_name
+    skill_file = project_skills_dir / "SKILL.md"
 
     try:
-        project_commands_dir.mkdir(parents=True, exist_ok=True)
-        # Use YAML block scalar to avoid breaking on quotes in description
+        project_skills_dir.mkdir(parents=True, exist_ok=True)
+        # Use YAML block scalar to avoid breaking on quotes in description.
         indented_desc = "\n  ".join(skill_description.split("\n"))
-        command_content = (
+        skill_content = (
             f"---\n"
+            f"name: {clean_name}\n"
             f"description: |\n"
             f"  {indented_desc}\n"
             f"---\n\n"
             f"# {skill_name}\n\n"
             f"This skill handles: {skill_description}\n"
         )
-        command_file.write_text(command_content)
+        skill_file.write_text(skill_content, encoding="utf-8")
 
         cmd = [
             "claude",
@@ -92,83 +102,125 @@ def run_single_query(
 
         triggered = False
         start_time = time.time()
-        buffer = ""
         # Track state for stream event detection
         pending_tool_name = None
         accumulated_json = ""
+        recon_tools = ("Read", "Grep", "Glob", "LS")  # read-only; safe to let run
+
+        # Read the subprocess pipe on a background thread and hand lines to the
+        # main loop via a queue. select.select() is socket-only on Windows (it
+        # raises WinError 10038 on a pipe handle), so we can't poll the pipe with
+        # a timeout there. The queue lets us honor the overall timeout and
+        # early-exit on trigger detection on every platform.
+        import threading
+        import queue as _queue
+        _dbg = os.environ.get("SKILL_EVAL_DEBUG")  # optional path: dump raw stream-json for diagnosis
+        line_q: "_queue.Queue" = _queue.Queue()
+
+        def _reader():
+            try:
+                for raw in process.stdout:
+                    s = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else raw
+                    if _dbg:
+                        try:
+                            with open(_dbg, "a", encoding="utf-8") as _fh:
+                                _fh.write(s)
+                        except Exception:
+                            pass
+                    line_q.put(s)
+            finally:
+                line_q.put(None)  # sentinel: stream closed
+
+        threading.Thread(target=_reader, daemon=True).start()
 
         try:
             while time.time() - start_time < timeout:
-                if process.poll() is not None:
-                    remaining = process.stdout.read()
-                    if remaining:
-                        buffer += remaining.decode("utf-8", errors="replace")
+                try:
+                    line = line_q.get(timeout=1.0)
+                except _queue.Empty:
+                    continue
+                if line is None:  # stream closed
                     break
-
-                ready, _, _ = select.select([process.stdout], [], [], 1.0)
-                if not ready:
+                line = line.strip()
+                if not line:
                     continue
 
-                chunk = os.read(process.stdout.fileno(), 8192)
-                if not chunk:
-                    break
-                buffer += chunk.decode("utf-8", errors="replace")
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
+                # Detection spans the WHOLE agentic turn, but resolves as soon as
+                # the model commits to a path — both to be fast and, importantly,
+                # to stop BEFORE a sibling skill or a mutating tool actually runs.
+                # These queries hit live ADO/repos, so a non-trigger case must not
+                # be allowed to execute side effects (filing a bug, creating cases).
+                #
+                #   Skill(<clean_name>)          -> triggered            (True)
+                #   Skill(<other>)               -> chose a sibling skill (False)
+                #   Read/Grep/Glob/LS  (recon)   -> harmless; keep scanning
+                #   any other tool (Bash/Edit/…) -> committed elsewhere   (False)
+                #   terminal `result`            -> answered in text only (False)
+                #
+                # We deliberately do NOT treat a per-message boundary (message_stop)
+                # as the end: the model routinely writes a text preamble and invokes
+                # the skill in a LATER message.
+                etype = event.get("type")
+                if etype == "stream_event":
+                    se = event.get("event", {})
+                    se_type = se.get("type", "")
 
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+                    if se_type == "content_block_start":
+                        cb = se.get("content_block", {})
+                        if cb.get("type") == "tool_use":
+                            name = cb.get("name", "")
+                            accumulated_json = ""
+                            if name in ("Skill", "Read"):
+                                pending_tool_name = name      # accumulate input, match clean_name
+                            elif name in recon_tools:
+                                pending_tool_name = None       # read-only recon: ignore, keep scanning
+                            else:
+                                return False                   # Bash/Edit/Write/... -> not our skill
 
-                    # Early detection via stream events
-                    if event.get("type") == "stream_event":
-                        se = event.get("event", {})
-                        se_type = se.get("type", "")
+                    elif se_type == "content_block_delta" and pending_tool_name in ("Skill", "Read"):
+                        delta = se.get("delta", {})
+                        if delta.get("type") == "input_json_delta":
+                            accumulated_json += delta.get("partial_json", "")
+                            if trigger_token in accumulated_json:
+                                return True
 
-                        if se_type == "content_block_start":
-                            cb = se.get("content_block", {})
-                            if cb.get("type") == "tool_use":
-                                tool_name = cb.get("name", "")
-                                if tool_name in ("Skill", "Read"):
-                                    pending_tool_name = tool_name
-                                    accumulated_json = ""
-                                else:
-                                    return False
+                    elif se_type == "content_block_stop":
+                        # A Skill block that finished without matching clean_name is
+                        # a sibling skill -> not triggered. A Read of some other file
+                        # is just recon -> keep scanning.
+                        if pending_tool_name == "Skill":
+                            return False
+                        pending_tool_name = None
+                        accumulated_json = ""
 
-                        elif se_type == "content_block_delta" and pending_tool_name:
-                            delta = se.get("delta", {})
-                            if delta.get("type") == "input_json_delta":
-                                accumulated_json += delta.get("partial_json", "")
-                                if clean_name in accumulated_json:
-                                    return True
+                # Fallback: full assistant message (fires once per message). Mirror
+                # the same logic so a context-gathering Read isn't read as a miss.
+                elif etype == "assistant":
+                    message = event.get("message", {})
+                    for content_item in message.get("content", []):
+                        if content_item.get("type") != "tool_use":
+                            continue
+                        name = content_item.get("name", "")
+                        inp = content_item.get("input", {})
+                        if name == "Skill":
+                            blob = str(inp.get("skill", "")) + " " + str(inp.get("command", ""))
+                            return trigger_token in blob
+                        if name == "Read":
+                            if trigger_token in str(inp.get("file_path", "")):
+                                return True
+                            continue
+                        if name in recon_tools:
+                            continue
+                        return False
 
-                        elif se_type in ("content_block_stop", "message_stop"):
-                            if pending_tool_name:
-                                return clean_name in accumulated_json
-                            if se_type == "message_stop":
-                                return False
-
-                    # Fallback: full assistant message
-                    elif event.get("type") == "assistant":
-                        message = event.get("message", {})
-                        for content_item in message.get("content", []):
-                            if content_item.get("type") != "tool_use":
-                                continue
-                            tool_name = content_item.get("name", "")
-                            tool_input = content_item.get("input", {})
-                            if tool_name == "Skill" and clean_name in tool_input.get("skill", ""):
-                                triggered = True
-                            elif tool_name == "Read" and clean_name in tool_input.get("file_path", ""):
-                                triggered = True
-                            return triggered
-
-                    elif event.get("type") == "result":
-                        return triggered
+                # Terminal: the agentic turn finished without invoking the skill.
+                elif etype == "result":
+                    return triggered
         finally:
             # Clean up process on any exit path (return, exception, timeout)
             if process.poll() is None:
@@ -177,8 +229,13 @@ def run_single_query(
 
         return triggered
     finally:
-        if command_file.exists():
-            command_file.unlink()
+        try:
+            if skill_file.exists():
+                skill_file.unlink()
+            if project_skills_dir.exists():
+                project_skills_dir.rmdir()
+        except OSError:
+            pass
 
 
 def run_eval(
